@@ -11,9 +11,11 @@ RUN apt-get update && echo YYY | mk-build-deps --install --remove /tmp/control
 
 ARG L_UID
 RUN if [ "$L_UID" -eq 0 ]; then \
-      useradd -m docker; \
+      useradd -m docker 2>/dev/null || true; \
+    elif id "$L_UID" > /dev/null 2>&1; then \
+      echo "UID $L_UID already exists, reusing"; \
     else \
-      useradd -m docker -u $L_UID;\
+      useradd -m docker -u $L_UID; \
     fi
 
 USER docker
