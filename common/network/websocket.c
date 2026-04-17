@@ -1050,7 +1050,23 @@ static int handle_login(ws_ctx_t *ws_ctx, const char *in,
     char username[USERNAME_LEN] = "";
     char password[512] = "";
 
-    /* Simple key=value scan — no url-decode needed for basic alphanumeric */
+    /* URL-decode a percent-encoded string in-place */
+#define URL_DECODE(buf) do { \
+        char *_r = (buf), *_w = (buf); \
+        while (*_r) { \
+            if (*_r == '%' && _r[1] && _r[2]) { \
+                char _hex[3] = { _r[1], _r[2], '\0' }; \
+                *_w++ = (char)strtol(_hex, NULL, 16); \
+                _r += 3; \
+            } else if (*_r == '+') { \
+                *_w++ = ' '; _r++; \
+            } else { \
+                *_w++ = *_r++; \
+            } \
+        } \
+        *_w = '\0'; \
+    } while (0)
+
     const char *p = body;
     while (*p) {
         char key[64] = "", val[512] = "";
@@ -1066,11 +1082,15 @@ static int handle_login(ws_ctx_t *ws_ctx, const char *in,
         memcpy(val, p, vlen); val[vlen] = '\0';
         p = amp ? amp + 1 : p + vlen;
 
-        if (strcmp(key, "username") == 0)
+        if (strcmp(key, "username") == 0) {
+            URL_DECODE(val);
             strncpy(username, val, sizeof(username) - 1);
-        else if (strcmp(key, "password") == 0)
+        } else if (strcmp(key, "password") == 0) {
+            URL_DECODE(val);
             strncpy(password, val, sizeof(password) - 1);
+        }
     }
+#undef URL_DECODE
 
     if (!username[0] || !password[0]) {
         sprintf(buf, "HTTP/1.1 302 Found\r\n"
