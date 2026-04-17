@@ -38,6 +38,134 @@
 #include "websocket.h"
 #include "jsonescape.h"
 #include <network/Blacklist.h>
+#include <openssl/rand.h>
+
+/*
+ * Session store — simple in-memory token map.
+ * Each token is a 32-byte hex string (64 chars).
+ * Sessions expire after SESSION_TTL_SECONDS of inactivity.
+ */
+#define SESSION_TTL_SECONDS  3600
+#define SESSION_TOKEN_BYTES  32
+#define SESSION_TOKEN_LEN    (SESSION_TOKEN_BYTES * 2)
+#define SESSION_MAX          256
+
+typedef struct {
+    char token[SESSION_TOKEN_LEN + 1];
+    char user[USERNAME_LEN];
+    unsigned char owner;
+    time_t last_seen;
+} session_t;
+
+static session_t session_store[SESSION_MAX];
+static pthread_mutex_t session_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Generate a random hex token into buf (must be SESSION_TOKEN_LEN+1 bytes). */
+static int gen_session_token(char *buf) {
+    unsigned char raw[SESSION_TOKEN_BYTES];
+    if (RAND_bytes(raw, SESSION_TOKEN_BYTES) != 1)
+        return -1;
+    for (int i = 0; i < SESSION_TOKEN_BYTES; i++)
+        snprintf(buf + i * 2, 3, "%02x", raw[i]);
+    buf[SESSION_TOKEN_LEN] = '\0';
+    return 0;
+}
+
+/* Create a new session. Returns 0 on success, -1 on failure. */
+static int session_create(const char *user, unsigned char owner, char *token_out) {
+    if (gen_session_token(token_out) != 0)
+        return -1;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&session_mutex);
+    /* Evict expired entries to find a free slot */
+    int slot = -1;
+    for (int i = 0; i < SESSION_MAX; i++) {
+        if (session_store[i].token[0] == '\0' ||
+            now - session_store[i].last_seen > SESSION_TTL_SECONDS) {
+            session_store[i].token[0] = '\0';
+            if (slot < 0) slot = i;
+        }
+    }
+    if (slot < 0) {
+        pthread_mutex_unlock(&session_mutex);
+        return -1;
+    }
+    strncpy(session_store[slot].token, token_out, SESSION_TOKEN_LEN + 1);
+    strncpy(session_store[slot].user, user, USERNAME_LEN - 1);
+    session_store[slot].user[USERNAME_LEN - 1] = '\0';
+    session_store[slot].owner = owner;
+    session_store[slot].last_seen = now;
+    pthread_mutex_unlock(&session_mutex);
+    return 0;
+}
+
+/* Validate token. Returns 1 if valid, sets user/owner. */
+static int session_validate(const char *token, char *user_out, unsigned char *owner_out) {
+    if (!token || strlen(token) != SESSION_TOKEN_LEN)
+        return 0;
+    time_t now = time(NULL);
+    pthread_mutex_lock(&session_mutex);
+    for (int i = 0; i < SESSION_MAX; i++) {
+        if (session_store[i].token[0] != '\0' &&
+            strcmp(session_store[i].token, token) == 0) {
+            if (now - session_store[i].last_seen > SESSION_TTL_SECONDS) {
+                session_store[i].token[0] = '\0';
+                pthread_mutex_unlock(&session_mutex);
+                return 0;
+            }
+            session_store[i].last_seen = now;
+            strncpy(user_out, session_store[i].user, USERNAME_LEN - 1);
+            user_out[USERNAME_LEN - 1] = '\0';
+            *owner_out = session_store[i].owner;
+            pthread_mutex_unlock(&session_mutex);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&session_mutex);
+    return 0;
+}
+
+/* Delete a session. */
+static void session_delete(const char *token) {
+    if (!token) return;
+    pthread_mutex_lock(&session_mutex);
+    for (int i = 0; i < SESSION_MAX; i++) {
+        if (session_store[i].token[0] != '\0' &&
+            strcmp(session_store[i].token, token) == 0) {
+            session_store[i].token[0] = '\0';
+            break;
+        }
+    }
+    pthread_mutex_unlock(&session_mutex);
+}
+
+/* Extract cookie value by name from Cookie header. Returns 1 on success. */
+static int get_cookie(const char *handshake, const char *name, char *out, size_t outlen) {
+    const char *hdr = strcasestr(handshake, "Cookie: ");
+    if (!hdr) return 0;
+    hdr += 8;
+    const char *end = strstr(hdr, "\r\n");
+    if (!end) end = hdr + strlen(hdr);
+    size_t nlen = strlen(name);
+    const char *p = hdr;
+    while (p < end) {
+        while (p < end && *p == ' ') p++;
+        if (strncmp(p, name, nlen) == 0 && p[nlen] == '=') {
+            p += nlen + 1;
+            const char *ve = memchr(p, ';', end - p);
+            if (!ve) ve = end;
+            size_t vlen = ve - p;
+            if (vlen >= outlen) vlen = outlen - 1;
+            memcpy(out, p, vlen);
+            out[vlen] = '\0';
+            return 1;
+        }
+        p = memchr(p, ';', end - p);
+        if (!p) break;
+        p++;
+    }
+    return 0;
+}
 
 /*
  * Global state
@@ -893,6 +1021,154 @@ static void dirlisting(ws_ctx_t *ws_ctx, const char fullpath[], const char path[
     ws_send(ws_ctx, buf, strlen(buf));
     totallen += strlen(buf);
     weblog(200, wsthread_handler_id, 0, origip, ip, user, 1, path, totallen);
+}
+
+/*
+ * POST /login  — parse username+password form body, validate, issue session cookie.
+ * Returns 1 if the request was handled (caller should not call servefile).
+ */
+static int handle_login(ws_ctx_t *ws_ctx, const char *in,
+                        const char * const ip, const char * const origip) {
+    char buf[WS_MAX_BUF_SIZE];
+
+    if (strncmp(in, "POST /login", 11) != 0)
+        return 0;
+
+    /* Find end of headers */
+    const char *body = strstr(in, "\r\n\r\n");
+    if (!body) {
+        sprintf(buf, "HTTP/1.1 400 Bad Request\r\n"
+                     "Server: KasmVNC/4.0\r\nConnection: close\r\n"
+                     "Content-type: text/plain\r\n%s\r\n400",
+                     extra_headers ? extra_headers : "");
+        ws_send(ws_ctx, buf, strlen(buf));
+        return 1;
+    }
+    body += 4;
+
+    /* Parse application/x-www-form-urlencoded: username=X&password=Y */
+    char username[USERNAME_LEN] = "";
+    char password[512] = "";
+
+    /* Simple key=value scan — no url-decode needed for basic alphanumeric */
+    const char *p = body;
+    while (*p) {
+        char key[64] = "", val[512] = "";
+        const char *eq = strchr(p, '=');
+        if (!eq) break;
+        size_t klen = eq - p;
+        if (klen >= sizeof(key)) klen = sizeof(key) - 1;
+        memcpy(key, p, klen); key[klen] = '\0';
+        p = eq + 1;
+        const char *amp = strchr(p, '&');
+        size_t vlen = amp ? (size_t)(amp - p) : strlen(p);
+        if (vlen >= sizeof(val)) vlen = sizeof(val) - 1;
+        memcpy(val, p, vlen); val[vlen] = '\0';
+        p = amp ? amp + 1 : p + vlen;
+
+        if (strcmp(key, "username") == 0)
+            strncpy(username, val, sizeof(username) - 1);
+        else if (strcmp(key, "password") == 0)
+            strncpy(password, val, sizeof(password) - 1);
+    }
+
+    if (!username[0] || !password[0]) {
+        sprintf(buf, "HTTP/1.1 302 Found\r\n"
+                     "Server: KasmVNC/4.0\r\nConnection: close\r\n"
+                     "Location: /login.html?error=1\r\n%s\r\n",
+                     extra_headers ? extra_headers : "");
+        ws_send(ws_ctx, buf, strlen(buf));
+        weblog(302, wsthread_handler_id, 0, origip, ip, "-", 1, "/login", strlen(buf));
+        return 1;
+    }
+
+    /* Validate against kasmpasswd file */
+    unsigned char owner = 0;
+    int auth_ok = 0;
+    if (settings.passwdfile) {
+        struct kasmpasswd_t *set = readkasmpasswd(settings.passwdfile);
+        if (set && set->num) {
+            unsigned i;
+            for (i = 0; i < set->num; i++) {
+                if (strcmp(set->entries[i].user, username) == 0) {
+                    struct crypt_data cdata;
+                    cdata.initialized = 0;
+                    const char *hashed = crypt_r(password, "$5$kasm$", &cdata);
+                    if (hashed && strcmp(set->entries[i].password, hashed) == 0) {
+                        auth_ok = 1;
+                        owner = set->entries[i].owner;
+                    }
+                    break;
+                }
+            }
+            free(set->entries);
+            free(set);
+        }
+    }
+
+    if (!auth_ok) {
+        bl_addFailure(ip);
+        wserr("Login attempt failed for user %s from %s\n", username, ip);
+        sprintf(buf, "HTTP/1.1 302 Found\r\n"
+                     "Server: KasmVNC/4.0\r\nConnection: close\r\n"
+                     "Location: /login.html?error=1\r\n%s\r\n",
+                     extra_headers ? extra_headers : "");
+        ws_send(ws_ctx, buf, strlen(buf));
+        weblog(302, wsthread_handler_id, 0, origip, ip, username, 1, "/login", strlen(buf));
+        return 1;
+    }
+
+    char token[SESSION_TOKEN_LEN + 1];
+    if (session_create(username, owner, token) != 0) {
+        sprintf(buf, "HTTP/1.1 500 Internal Server Error\r\n"
+                     "Server: KasmVNC/4.0\r\nConnection: close\r\n"
+                     "Content-type: text/plain\r\n%s\r\n500",
+                     extra_headers ? extra_headers : "");
+        ws_send(ws_ctx, buf, strlen(buf));
+        return 1;
+    }
+
+    wserr("Login succeeded for user %s from %s\n", username, ip);
+    snprintf(buf, sizeof(buf),
+             "HTTP/1.1 302 Found\r\n"
+             "Server: KasmVNC/4.0\r\nConnection: close\r\n"
+             "Set-Cookie: sessionid=%s; Path=/; HttpOnly; SameSite=Strict\r\n"
+             "Location: /\r\n%s\r\n",
+             token, extra_headers ? extra_headers : "");
+    ws_send(ws_ctx, buf, strlen(buf));
+    weblog(302, wsthread_handler_id, 0, origip, ip, username, 1, "/login", strlen(buf));
+    return 1;
+}
+
+/*
+ * GET/POST /logout — clear session cookie and redirect to /login.html.
+ * Returns 1 if the request was handled.
+ */
+static int handle_logout(ws_ctx_t *ws_ctx, const char *in,
+                         const char * const ip, const char * const origip) {
+    char buf[WS_MAX_BUF_SIZE];
+
+    /* Match GET /logout or POST /logout */
+    const char *p = in;
+    int is_get  = (strncmp(p, "GET /logout",  11) == 0);
+    int is_post = (strncmp(p, "POST /logout", 12) == 0);
+    if (!is_get && !is_post)
+        return 0;
+
+    char token[SESSION_TOKEN_LEN + 1] = "";
+    get_cookie(in, "sessionid", token, sizeof(token));
+    if (token[0])
+        session_delete(token);
+
+    snprintf(buf, sizeof(buf),
+             "HTTP/1.1 302 Found\r\n"
+             "Server: KasmVNC/4.0\r\nConnection: close\r\n"
+             "Set-Cookie: sessionid=; Path=/; HttpOnly; Max-Age=0\r\n"
+             "Location: /login.html\r\n%s\r\n",
+             extra_headers ? extra_headers : "");
+    ws_send(ws_ctx, buf, strlen(buf));
+    weblog(302, wsthread_handler_id, 0, origip, ip, "-", 1, "/logout", strlen(buf));
+    return 1;
 }
 
 static void servefile(ws_ctx_t *ws_ctx, const char *in, const char * const user,
@@ -1917,104 +2193,167 @@ ws_ctx_t *do_handshake(int sock, char * const ip) {
 
     unsigned char owner = 0;
     char inuser[USERNAME_LEN] = "-";
+
     if (!settings.disablebasicauth) {
-        const char *hdr = strcasestr(handshake, "Authorization: Basic ");
-        if (!hdr) {
-            bl_addFailure(ip);
-            wserr("Authentication attempt failed, BasicAuth required, but client didn't send any\n");
-            sprintf(response, "HTTP/1.1 401 Unauthorized\r\n"
-                              "WWW-Authenticate: Basic realm=\"Websockify\"\r\n"
-                              "%s"
-                              "\r\n", extra_headers ? extra_headers : "");
-            ws_send(ws_ctx, response, strlen(response));
-            weblog(401, wsthread_handler_id, 0, origip, ip, "-", 1, url, strlen(response));
+        /* --- Step 1: Handle unauthenticated login/logout routes first --- */
+        if (handle_logout(ws_ctx, handshake, ip, origip)) {
+            free_ws_ctx(ws_ctx);
+            return NULL;
+        }
+        if (handle_login(ws_ctx, handshake, ip, origip)) {
             free_ws_ctx(ws_ctx);
             return NULL;
         }
 
-        hdr += sizeof("Authorization: Basic ") - 1;
-        const char *end = strchr(hdr, '\r');
-        if (!end || end - hdr > 256) {
-            wserr("Authentication attempt failed, client sent invalid BasicAuth\n");
-            bl_addFailure(ip);
-            send403(ws_ctx, origip, ip);
-            free_ws_ctx(ws_ctx);
-            return NULL;
+        /* Allow /login.html and its assets through without auth */
+        int is_public = 0;
+        {
+            const char *ustart = handshake + (strncmp(handshake, "GET ", 4) == 0 ? 4 :
+                                              strncmp(handshake, "POST ", 5) == 0 ? 5 : 0);
+            is_public = (strncmp(ustart, "/login.html", 11) == 0 ||
+                         strncmp(ustart, "/login.css",  10) == 0 ||
+                         strncmp(ustart, "/favicon",     7) == 0);
         }
-        len = end - hdr;
-        char tmp[257];
-        memcpy(tmp, hdr, len);
-        tmp[len] = '\0';
-        len = ws_b64_pton(tmp, response, 256);
 
-        char authbuf[4096] = "";
+        if (!is_public) {
+            /* --- Step 2: Check session cookie --- */
+            char cookie_token[SESSION_TOKEN_LEN + 1] = "";
+            int cookie_ok = 0;
+            if (get_cookie(handshake, "sessionid", cookie_token, sizeof(cookie_token))) {
+                cookie_ok = session_validate(cookie_token, inuser, &owner);
+            }
 
-        // Do we need to read it from the file?
-        char *resppw = strchr(response, ':');
-        if (resppw && *resppw)
-            resppw++;
-        if (settings.passwdfile) {
-            if (resppw && *resppw && resppw - response < USERNAME_LEN + 1) {
-                char pwbuf[4096];
-                struct kasmpasswd_t *set = readkasmpasswd(settings.passwdfile);
-                if (!set->num) {
-                    wserr("Error: BasicAuth configured to read password from file %s, but the file doesn't exist or has no valid users\n",
-                            settings.passwdfile);
-                } else {
-                    unsigned i;
-                    unsigned char found = 0;
-                    memcpy(inuser, response, resppw - response - 1);
-                    inuser[resppw - response - 1] = '\0';
-
-                    for (i = 0; i < set->num; i++) {
-                        if (!strcmp(set->entries[i].user, inuser)) {
-                            found = 1;
-                            strcpy(ws_ctx->user, inuser);
-                            snprintf(authbuf, 4096, "%s:%s", set->entries[i].user,
-                                     set->entries[i].password);
-                            authbuf[4095] = '\0';
-
-                            if (set->entries[i].owner)
-                                owner = 1;
-                            break;
-                        }
+            /* --- Step 3: Check Bearer token (Authorization: Bearer <token>) --- */
+            if (!cookie_ok) {
+                const char *bearer_hdr = strcasestr(handshake, "Authorization: Bearer ");
+                if (bearer_hdr) {
+                    bearer_hdr += sizeof("Authorization: Bearer ") - 1;
+                    const char *bend = strchr(bearer_hdr, '\r');
+                    if (bend && (bend - bearer_hdr) == SESSION_TOKEN_LEN) {
+                        char bearer_token[SESSION_TOKEN_LEN + 1];
+                        memcpy(bearer_token, bearer_hdr, SESSION_TOKEN_LEN);
+                        bearer_token[SESSION_TOKEN_LEN] = '\0';
+                        cookie_ok = session_validate(bearer_token, inuser, &owner);
                     }
-
-                    if (!found)
-                        wserr("Authentication attempt failed, user %s does not exist\n", inuser);
                 }
-                free(set->entries);
-                free(set);
+            }
 
-                struct crypt_data cdata;
-                cdata.initialized = 0;
+            /* --- Step 4: Fall back to BasicAuth for legacy/API clients --- */
+            if (!cookie_ok) {
+                const char *hdr = strcasestr(handshake, "Authorization: Basic ");
+                if (!hdr) {
+                    /* No auth at all — redirect HTTP requests to login page,
+                     * send 401 for WebSocket upgrade attempts */
+                    const int is_ws_upgrade = (strcasestr(handshake, "Upgrade: websocket") != NULL);
+                    if (is_ws_upgrade) {
+                        bl_addFailure(ip);
+                        wserr("WebSocket auth failed, no session or BasicAuth from %s\n", ip);
+                        sprintf(response, "HTTP/1.1 401 Unauthorized\r\n"
+                                          "WWW-Authenticate: Basic realm=\"Websockify\"\r\n"
+                                          "%s"
+                                          "\r\n", extra_headers ? extra_headers : "");
+                        ws_send(ws_ctx, response, strlen(response));
+                        weblog(401, wsthread_handler_id, 0, origip, ip, "-", 1, url, strlen(response));
+                    } else {
+                        /* HTTP request — redirect to login page */
+                        snprintf(response, sizeof(response),
+                                 "HTTP/1.1 302 Found\r\n"
+                                 "Server: KasmVNC/4.0\r\nConnection: close\r\n"
+                                 "Location: /login.html\r\n%s\r\n",
+                                 extra_headers ? extra_headers : "");
+                        ws_send(ws_ctx, response, strlen(response));
+                        weblog(302, wsthread_handler_id, 0, origip, ip, "-", 1, url, strlen(response));
+                    }
+                    free_ws_ctx(ws_ctx);
+                    return NULL;
+                }
 
-                const char *encrypted = crypt_r(resppw, "$5$kasm$", &cdata);
-                *resppw = '\0';
+                hdr += sizeof("Authorization: Basic ") - 1;
+                const char *end = strchr(hdr, '\r');
+                if (!end || end - hdr > 256) {
+                    wserr("Authentication attempt failed, client sent invalid BasicAuth\n");
+                    bl_addFailure(ip);
+                    send403(ws_ctx, origip, ip);
+                    free_ws_ctx(ws_ctx);
+                    return NULL;
+                }
+                len = end - hdr;
+                char tmp[257];
+                memcpy(tmp, hdr, len);
+                tmp[len] = '\0';
+                len = ws_b64_pton(tmp, response, 256);
 
-                snprintf(pwbuf, 4096, "%s%s", response, encrypted);
-                pwbuf[4095] = '\0';
-                strcpy(response, pwbuf);
+                char authbuf[4096] = "";
+
+                char *resppw = strchr(response, ':');
+                if (resppw && *resppw)
+                    resppw++;
+                if (settings.passwdfile) {
+                    if (resppw && *resppw && resppw - response < USERNAME_LEN + 1) {
+                        char pwbuf[4096];
+                        struct kasmpasswd_t *set = readkasmpasswd(settings.passwdfile);
+                        if (!set->num) {
+                            wserr("Error: BasicAuth configured to read password from file %s, but the file doesn't exist or has no valid users\n",
+                                    settings.passwdfile);
+                        } else {
+                            unsigned i;
+                            unsigned char found = 0;
+                            memcpy(inuser, response, resppw - response - 1);
+                            inuser[resppw - response - 1] = '\0';
+
+                            for (i = 0; i < set->num; i++) {
+                                if (!strcmp(set->entries[i].user, inuser)) {
+                                    found = 1;
+                                    strcpy(ws_ctx->user, inuser);
+                                    snprintf(authbuf, 4096, "%s:%s", set->entries[i].user,
+                                             set->entries[i].password);
+                                    authbuf[4095] = '\0';
+
+                                    if (set->entries[i].owner)
+                                        owner = 1;
+                                    break;
+                                }
+                            }
+
+                            if (!found)
+                                wserr("Authentication attempt failed, user %s does not exist\n", inuser);
+                        }
+                        free(set->entries);
+                        free(set);
+
+                        struct crypt_data cdata;
+                        cdata.initialized = 0;
+
+                        const char *encrypted = crypt_r(resppw, "$5$kasm$", &cdata);
+                        *resppw = '\0';
+
+                        snprintf(pwbuf, 4096, "%s%s", response, encrypted);
+                        pwbuf[4095] = '\0';
+                        strcpy(response, pwbuf);
+                    } else {
+                        response[0] = '\0';
+                        authbuf[0] = 'a';
+                        authbuf[1] = '\0';
+                    }
+                }
+
+                if (len <= 0 || strcmp(authbuf, response)) {
+                    wserr("Authentication attempt failed, wrong password for user %s\n", inuser);
+                    bl_addFailure(ip);
+                    sprintf(response, "HTTP/1.1 401 Forbidden\r\n"
+                                      "%s"
+                                      "\r\n", extra_headers ? extra_headers : "");
+                    ws_send(ws_ctx, response, strlen(response));
+                    weblog(401, wsthread_handler_id, 0, origip, ip, inuser, 1, url, strlen(response));
+                    free_ws_ctx(ws_ctx);
+                    return NULL;
+                }
+                handler_emsg("BasicAuth matched\n");
             } else {
-                // Client tried an empty password, just fail them
-                response[0] = '\0';
-                authbuf[0] = 'a';
-                authbuf[1] = '\0';
+                strcpy(ws_ctx->user, inuser);
+                handler_emsg("Session cookie/bearer auth matched for user %s\n", inuser);
             }
         }
-
-        if (len <= 0 || strcmp(authbuf, response)) {
-            wserr("Authentication attempt failed, wrong password for user %s\n", inuser);
-            bl_addFailure(ip);
-            sprintf(response, "HTTP/1.1 401 Forbidden\r\n"
-                              "%s"
-                              "\r\n", extra_headers ? extra_headers : "");
-            ws_send(ws_ctx, response, strlen(response));
-            weblog(401, wsthread_handler_id, 0, origip, ip, inuser, 1, url, strlen(response));
-            free_ws_ctx(ws_ctx);
-            return NULL;
-        }
-        handler_emsg("BasicAuth matched\n");
     }
 
     //handler_msg("handshake: %s\n", handshake);
