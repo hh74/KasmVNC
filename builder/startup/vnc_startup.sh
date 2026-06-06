@@ -61,13 +61,26 @@ vncserver -kill $DISPLAY &> $HOME/.vnc/vnc_startup.log \
 
 [ -n "$KASMVNC_VERBOSE_LOGGING" ] && verbose_logging_option="-debug"
 
+BROK_MODE=${BROK_MODE:-desktop}
+
 echo -e "start vncserver with param: VNC_COL_DEPTH=$VNC_COL_DEPTH, VNC_RESOLUTION=$VNC_RESOLUTION\n..."
-vncserver $DISPLAY -select-de xfce -depth $VNC_COL_DEPTH -geometry $VNC_RESOLUTION -FrameRate=$MAX_FRAME_RATE -websocketPort $VNC_PORT $VNCOPTIONS $verbose_logging_option #&> $STARTUPDIR/no_vnc_startup.log
+
+vncserver_args="$DISPLAY -depth $VNC_COL_DEPTH -geometry $VNC_RESOLUTION -FrameRate=$MAX_FRAME_RATE -websocketPort $VNC_PORT $VNCOPTIONS $verbose_logging_option"
+
+if [ "$BROK_MODE" = "shell" ]; then
+    echo "BROK_MODE=shell — starting Xvnc without desktop environment"
+else
+    vncserver_args="-select-de xfce $vncserver_args"
+fi
+
+vncserver $vncserver_args
 
 PID_SUN=$!
 
 echo -e "start window manager\n..."
-$STARTUPDIR/window_manager_startup.sh #&> $STARTUPDIR/window_manager_startup.log
+if [ "$BROK_MODE" != "shell" ]; then
+    $STARTUPDIR/window_manager_startup.sh
+fi
 
 ## log connect options
 echo -e "\n\n------------------ VNC environment started ------------------"

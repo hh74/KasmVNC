@@ -39,6 +39,11 @@
 #include "jsonescape.h"
 #include <network/Blacklist.h>
 #include <openssl/rand.h>
+#include <pty.h>
+#include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <signal.h>
 
 /*
  * Session store — simple in-memory token map.
@@ -54,6 +59,7 @@ typedef struct {
     char token[SESSION_TOKEN_LEN + 1];
     char user[USERNAME_LEN];
     unsigned char owner;
+    int mode;
     time_t last_seen;
 } session_t;
 
@@ -72,7 +78,7 @@ static int gen_session_token(char *buf) {
 }
 
 /* Create a new session. Returns 0 on success, -1 on failure. */
-static int session_create(const char *user, unsigned char owner, char *token_out) {
+static int session_create(const char *user, unsigned char owner, int mode, char *token_out) {
     if (gen_session_token(token_out) != 0)
         return -1;
     time_t now = time(NULL);
@@ -94,6 +100,7 @@ static int session_create(const char *user, unsigned char owner, char *token_out
     strncpy(session_store[slot].user, user, USERNAME_LEN - 1);
     session_store[slot].user[USERNAME_LEN - 1] = '\0';
     session_store[slot].owner = owner;
+    session_store[slot].mode = mode;
     session_store[slot].last_seen = now;
     pthread_mutex_unlock(&session_mutex);
     return 0;
@@ -1046,9 +1053,10 @@ static int handle_login(ws_ctx_t *ws_ctx, const char *in,
     }
     body += 4;
 
-    /* Parse application/x-www-form-urlencoded: username=X&password=Y */
+    /* Parse application/x-www-form-urlencoded: username=X&password=Y&mode=X */
     char username[USERNAME_LEN] = "";
     char password[512] = "";
+    int mode = 0;  /* 0 = desktop, 1 = shell */
 
     /* URL-decode a percent-encoded string in-place */
 #define URL_DECODE(buf) do { \
@@ -1088,6 +1096,8 @@ static int handle_login(ws_ctx_t *ws_ctx, const char *in,
         } else if (strcmp(key, "password") == 0) {
             URL_DECODE(val);
             strncpy(password, val, sizeof(password) - 1);
+        } else if (strcmp(key, "mode") == 0) {
+            mode = (strcmp(val, "shell") == 0) ? 1 : 0;
         }
     }
 #undef URL_DECODE
@@ -1139,7 +1149,7 @@ static int handle_login(ws_ctx_t *ws_ctx, const char *in,
     }
 
     char token[SESSION_TOKEN_LEN + 1];
-    if (session_create(username, owner, token) != 0) {
+    if (session_create(username, owner, mode, token) != 0) {
         sprintf(buf, "HTTP/1.1 500 Internal Server Error\r\n"
                      "Server: KasmVNC/4.0\r\nConnection: close\r\n"
                      "Content-type: text/plain\r\n%s\r\n500",
@@ -1148,13 +1158,14 @@ static int handle_login(ws_ctx_t *ws_ctx, const char *in,
         return 1;
     }
 
-    wserr("Login succeeded for user %s from %s\n", username, ip);
+    wserr("Login succeeded for user %s from %s (mode=%s)\n", username, ip,
+          mode ? "shell" : "desktop");
     snprintf(buf, sizeof(buf),
              "HTTP/1.1 302 Found\r\n"
              "Server: KasmVNC/4.0\r\nConnection: close\r\n"
              "Set-Cookie: sessionid=%s; Path=/; HttpOnly; SameSite=Strict\r\n"
-             "Location: /\r\n%s\r\n",
-             token, extra_headers ? extra_headers : "");
+             "Location: %s\r\n%s\r\n",
+             token, mode ? "/shell.html" : "/", extra_headers ? extra_headers : "");
     ws_send(ws_ctx, buf, strlen(buf));
     weblog(302, wsthread_handler_id, 0, origip, ip, username, 1, "/login", strlen(buf));
     return 1;
@@ -2099,6 +2110,137 @@ timeout:
     return 1;
 }
 
+/*
+ * shell_bridge — fork a PTY running bash and bridge it to the WebSocket.
+ * Called after the WebSocket handshake has been accepted for the /shell path.
+ */
+static void shell_bridge(ws_ctx_t *ws_ctx) {
+    int pty_master;
+    pid_t pid = forkpty(&pty_master, NULL, NULL, NULL);
+
+    if (pid == -1) {
+        wserr("shell_bridge: forkpty failed\n");
+        return;
+    }
+
+    if (pid == 0) {
+        const char *shell = "/bin/bash";
+        execl(shell, shell, (char *)NULL);
+        execl("/bin/sh", "/bin/sh", (char *)NULL);
+        _exit(1);
+    }
+
+    /* Set initial terminal size so bash doesn't exit immediately */
+    struct winsize ws_init = { .ws_row = 24, .ws_col = 80, .ws_xpixel = 0, .ws_ypixel = 0 };
+    ioctl(pty_master, TIOCSWINSZ, &ws_init);
+
+    unsigned char pty_buf[BUFSIZE];
+    unsigned char ws_raw[BUFSIZE];
+    unsigned int tin_end = 0;
+    int len;
+
+    while (1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(ws_ctx->sockfd, &rfds);
+        FD_SET(pty_master, &rfds);
+
+        int maxfd = (ws_ctx->sockfd > pty_master) ? ws_ctx->sockfd : pty_master;
+
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        int ret = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            wserr("shell_bridge: select error: %s\n", strerror(errno));
+            break;
+        }
+
+        if (FD_ISSET(pty_master, &rfds)) {
+            len = read(pty_master, pty_buf, sizeof(pty_buf));
+            if (len <= 0) break;
+            len = encode_hybi(pty_buf, len, ws_ctx->cout_buf, BUFSIZE, OPCODE_BINARY);
+            if (len > 0) ws_send(ws_ctx, ws_ctx->cout_buf, len);
+        }
+
+        if (FD_ISSET(ws_ctx->sockfd, &rfds)) {
+            ssize_t n = ws_recv(ws_ctx, ws_raw + tin_end,
+                                sizeof(ws_raw) - 1 - tin_end);
+            if (n <= 0) break;
+            tin_end += n;
+
+            /* Custom WebSocket frame parser — more lenient than decode_hybi.
+             * Handles both masked and unmasked binary/text frames. */
+            while (tin_end >= 2) {
+                unsigned char *raw = ws_raw;
+                unsigned int op = raw[0] & 0x0F;
+                unsigned int plen = raw[1] & 0x7F;
+                unsigned int hdr_len = 2;
+
+                if (plen == 126) {
+                    if (tin_end < 4) break;
+                    plen = (raw[2] << 8) | raw[3];
+                    hdr_len = 4;
+                } else if (plen == 127) {
+                    if (tin_end < 10) break;
+                    plen = 0;
+                    for (int i = 0; i < 8; i++)
+                        plen = (plen << 8) | raw[2 + i];
+                    hdr_len = 10;
+                }
+
+                unsigned int total_len = hdr_len + plen + 4; /* +4 for mask key */
+                if (tin_end < total_len) break; /* incomplete frame */
+
+                if (op == 0x8) { /* close */
+                    len = -1;
+                    break;
+                }
+
+                if (op == 0x9) { /* ping */
+                    /* send pong */
+                    raw[0] = 0x8A; /* FIN + PONG */
+                    ws_send(ws_ctx, raw, total_len);
+                } else if ((op == 0x1 || op == 0x2) && plen > 0) {
+                    /* text or binary frame — unmask and write to pty */
+                    unsigned char *mask_key = raw + hdr_len;
+                    unsigned char *payload = mask_key + 4;
+                    for (unsigned int i = 0; i < plen; i++)
+                        payload[i] ^= mask_key[i & 3];
+                    if (payload[0] == '{') {
+                        int cols = 0, rows = 0;
+                        if (sscanf((char *)payload, "{\"cols\":%d,\"rows\":%d}", &cols, &rows) == 2 ||
+                            sscanf((char *)payload, "{\"rows\":%d,\"cols\":%d}", &rows, &cols) == 2) {
+                            struct winsize ws = { .ws_row = (unsigned short)rows,
+                                                 .ws_col = (unsigned short)cols,
+                                                 .ws_xpixel = 0, .ws_ypixel = 0 };
+                            ioctl(pty_master, TIOCSWINSZ, &ws);
+                        }
+                    } else {
+                        write(pty_master, payload, plen);
+                    }
+                }
+
+                /* Remove processed frame from buffer */
+                if (total_len < tin_end)
+                    memmove(ws_raw, ws_raw + total_len, tin_end - total_len);
+                tin_end -= total_len;
+            }
+
+            if (len == -1) break; /* close frame received */
+        }
+
+        int status;
+        if (waitpid(pid, &status, WNOHANG) > 0) {
+            wserr("shell_bridge: child exited with status %d\n", WEXITSTATUS(status));
+            break;
+        }
+    }
+
+    close(pty_master);
+    kill(pid, SIGTERM);
+    waitpid(pid, NULL, 0);
+}
+
 ws_ctx_t *do_handshake(int sock, char * const ip) {
     char handshake[16 * 1024], response[4096], sha1[29], trailer[17];
     char *scheme, *pre;
@@ -2377,6 +2519,37 @@ ws_ctx_t *do_handshake(int sock, char * const ip) {
     }
 
     //handler_msg("handshake: %s\n", handshake);
+
+    /* --- /shell WebSocket fast path: bypass parse_handshake --- */
+    {
+        const char *p = handshake;
+        while (*p == ' ') p++;
+        if (strncmp(p, "GET /shell", 10) == 0 &&
+            strcasestr(handshake, "Upgrade: websocket") &&
+            strcasestr(handshake, "Sec-WebSocket-Key:")) {
+            const char *key_start = strcasestr(handshake, "Sec-WebSocket-Key:");
+            key_start += 19;
+            while (*key_start == ' ') key_start++;
+            const char *key_end = strstr(key_start, "\r\n");
+            if (!key_end) key_end = strchr(key_start, '\n');
+            if (key_end) {
+                unsigned klen = key_end - key_start;
+                if (klen >= sizeof(ws_ctx->headers->key1))
+                    klen = sizeof(ws_ctx->headers->key1) - 1;
+                memcpy(ws_ctx->headers->key1, key_start, klen);
+                ws_ctx->headers->key1[klen] = '\0';
+            }
+            wserr("/shell WebSocket from %s (user=%s)\n", ip, inuser);
+            gen_sha1(ws_ctx->headers, sha1);
+            snprintf(response, sizeof(response), SERVER_HANDSHAKE_HYBI,
+                     sha1, "null");
+            ws_send(ws_ctx, response, strlen(response));
+            shell_bridge(ws_ctx);
+            free_ws_ctx(ws_ctx);
+            return NULL;
+        }
+    }
+
     if (!parse_handshake(ws_ctx, handshake)) {
         handler_emsg("Invalid WS request, maybe a HTTP one\n");
 
@@ -2404,6 +2577,40 @@ ws_ctx_t *do_handshake(int sock, char * const ip) {
             servefile(ws_ctx, handshake, inuser, ip, origip);
 
 done:
+        free_ws_ctx(ws_ctx);
+        return NULL;
+    }
+
+    /* --- /shell WebSocket: PTY bridge --- */
+    if (strcmp(ws_ctx->headers->path, "/shell") == 0) {
+        wserr("/shell WebSocket from %s (user=%s)\n", ip, inuser);
+        response_protocol = strtok(ws_ctx->headers->protocols, ",");
+        if (!response_protocol || !strlen(response_protocol)) {
+            ws_ctx->opcode = OPCODE_BINARY;
+            response_protocol = "null";
+        } else if (!strcmp(response_protocol, "base64")) {
+            ws_ctx->opcode = OPCODE_TEXT;
+        } else {
+            ws_ctx->opcode = OPCODE_BINARY;
+        }
+        if (ws_ctx->hybi > 0) {
+            gen_sha1(ws_ctx->headers, sha1);
+            snprintf(response, sizeof(response), SERVER_HANDSHAKE_HYBI, sha1, response_protocol);
+        } else {
+            if (ws_ctx->hixie == 76) {
+                gen_md5(ws_ctx->headers, trailer);
+                pre = "Sec-";
+            } else {
+                trailer[0] = '\0';
+                pre = "";
+            }
+            snprintf(response, sizeof(response), SERVER_HANDSHAKE_HIXIE,
+                     pre, ws_ctx->headers->origin,
+                     pre, scheme, ws_ctx->headers->host,
+                     ws_ctx->headers->path, pre, "base64", trailer);
+        }
+        ws_send(ws_ctx, response, strlen(response));
+        shell_bridge(ws_ctx);
         free_ws_ctx(ws_ctx);
         return NULL;
     }

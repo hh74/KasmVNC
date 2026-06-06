@@ -1,3 +1,11 @@
+kasmvnc (1.4.0-1) unstable; urgency=medium
+
+  * Add xterm.js webshell variant with mode selector on login page.
+  * Add /shell WebSocket endpoint with PTY bridge (forkpty + select loop).
+  * Support BROK_MODE=shell to skip Xfce desktop for low-power hosts.
+
+ -- Kasm Technologies LLC <info@kasmweb.com>  Thu, 05 Jun 2026 12:00:00 +0000
+
 kasmvnc (1.3.4-1) unstable; urgency=medium
 
   * Add configuration key network.udp.payload_size.
