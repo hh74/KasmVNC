@@ -2541,8 +2541,12 @@ ws_ctx_t *do_handshake(int sock, char * const ip) {
             }
             wserr("/shell WebSocket from %s (user=%s)\n", ip, inuser);
             gen_sha1(ws_ctx->headers, sha1);
-            snprintf(response, sizeof(response), SERVER_HANDSHAKE_HYBI,
-                     sha1, "null");
+            snprintf(response, sizeof(response),
+                     "HTTP/1.1 101 Switching Protocols\r\n"
+                     "Upgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Accept: %s\r\n"
+                     "\r\n", sha1);
             ws_send(ws_ctx, response, strlen(response));
             shell_bridge(ws_ctx);
             free_ws_ctx(ws_ctx);
